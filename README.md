@@ -4,6 +4,41 @@
 
 ---
 
+## OpenAI-Compatible Provider Mode (Stage 1)
+
+Claude Code can be configured to send model requests to an **OpenAI-compatible Responses API** endpoint instead of the default Anthropic backend.  This is useful for using cheaper alternatives (e.g. DeepSeek) while studying or testing the system locally.
+
+### Required Environment Variables
+
+| Variable | Description |
+|---|---|
+| `CLAUDE_CODE_OPENAI_COMPAT=1` | Enable OpenAI-compatible mode |
+| `OPENAI_BASE_URL` | Base URL of the compatible provider (e.g. `https://api.deepseek.com`) |
+| `OPENAI_API_KEY` | API key for the compatible provider |
+| `OPENAI_MODEL` | Model name to use (e.g. `deepseek-chat`) |
+
+### Example
+
+```sh
+export CLAUDE_CODE_OPENAI_COMPAT=1
+export OPENAI_BASE_URL=https://api.deepseek.com
+export OPENAI_API_KEY=sk-...
+export OPENAI_MODEL=deepseek-chat
+```
+
+### Current Limitations (Stage 1)
+
+> **⚠️ Tool / function calling is NOT supported in Stage 1.**
+> Sending a prompt that causes the model to return a tool call will result in the response being ignored.  Only plain text chat streaming is implemented.  Tool support will be added in a future stage.
+
+The implementation calls the **Responses API** endpoint (`POST /v1/responses`) with streaming enabled and converts Claude Code's internal message format to the Responses API `input` format (text-only content blocks; non-text blocks such as images and tool results are silently dropped on conversion).
+
+When `CLAUDE_CODE_OPENAI_COMPAT` is **not** set, all behaviour is identical to the original Anthropic path.
+
+---
+
+---
+
 ## Research Context
 
 This repository is maintained by a **university student** studying:

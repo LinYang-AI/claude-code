@@ -74,6 +74,7 @@ import { computeFingerprintFromMessages } from '../../utils/fingerprint.js'
 import { captureAPIRequest, logError } from '../../utils/log.js'
 import {
   createAssistantAPIErrorMessage,
+  createAssistantMessage,
   createUserMessage,
   ensureToolResultPairing,
   normalizeContentFromAPI,
@@ -82,6 +83,11 @@ import {
   stripCallerFieldFromAssistantMessage,
   stripToolReferenceBlocksFromUserMessage,
 } from '../../utils/messages.js'
+import {
+  convertMessagesToResponsesInput,
+  getOpenAICompatConfig,
+  streamResponsesAPI,
+} from './openaiCompatResponses.js'
 import {
   getDefaultOpusModel,
   getDefaultSonnetModel,
@@ -1014,6 +1020,168 @@ export function stripExcessMediaItems(
   }) as (UserMessage | AssistantMessage)[]
 }
 
+/**
+ * OpenAI-compatible Responses API streaming path (Stage 1: text-only).
+ *
+ * Handles the full streaming lifecycle:
+ * 1. Validates required env vars and converts the message history.
+ * 2. Calls the Responses API, forwarding the abort signal.
+ * 3. Yields synthetic Anthropic-shaped stream_event items so the existing
+ *    streaming text UI updates incrementally.
+ * 4. Yields one AssistantMessage with the full accumulated text at the end.
+ *
+ * Tool / function calling is intentionally NOT implemented here (Stage 1).
+ * Any tool_use blocks in the message history are silently ignored on input
+ * conversion; tool requests in the model's response are not processed.
+ */
+async function* queryModelOpenAICompat(
+  messages: Message[],
+  systemPrompt: SystemPrompt,
+  signal: AbortSignal,
+): AsyncGenerator<StreamEvent | AssistantMessage | SystemAPIErrorMessage, void> {
+  try {
+    const config = getOpenAICompatConfig()
+    const input = convertMessagesToResponsesInput(messages)
+    const instructions = systemPrompt.join('\n').trim() || undefined
+
+    const start = Date.now()
+    let fullText = ''
+    let isFirstChunk = true
+    let ttftMs = 0
+    let messageStartYielded = false
+
+    for await (const delta of streamResponsesAPI(
+      config,
+      input,
+      instructions,
+      signal,
+    )) {
+      if (isFirstChunk) {
+        ttftMs = Date.now() - start
+        isFirstChunk = false
+
+        // Yield message_start with accurate TTFT now that we have the first chunk.
+        yield {
+          type: 'stream_event',
+          event: {
+            type: 'message_start',
+            message: {
+              id: randomUUID(),
+              type: 'message',
+              role: 'assistant',
+              content: [],
+              model: config.model,
+              stop_reason: null,
+              stop_sequence: null,
+              usage: {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+              },
+            },
+          } as unknown as BetaRawMessageStreamEvent,
+          ttftMs,
+        }
+        messageStartYielded = true
+
+        // Synthetic content_block_start (text) — switches UI to 'responding' mode.
+        yield {
+          type: 'stream_event',
+          event: {
+            type: 'content_block_start',
+            index: 0,
+            content_block: { type: 'text', text: '' },
+          } as unknown as BetaRawMessageStreamEvent,
+        }
+      }
+
+      fullText += delta.text
+
+      // Synthetic content_block_delta — drives the live streaming text preview.
+      yield {
+        type: 'stream_event',
+        event: {
+          type: 'content_block_delta',
+          index: 0,
+          delta: { type: 'text_delta', text: delta.text },
+        } as unknown as BetaRawMessageStreamEvent,
+      }
+    }
+
+    // If we never received any chunks, still yield a message_start so the
+    // query loop sees a properly structured response.
+    if (!messageStartYielded) {
+      yield {
+        type: 'stream_event',
+        event: {
+          type: 'message_start',
+          message: {
+            id: randomUUID(),
+            type: 'message',
+            role: 'assistant',
+            content: [],
+            model: config.model,
+            stop_reason: null,
+            stop_sequence: null,
+            usage: {
+              input_tokens: 0,
+              output_tokens: 0,
+              cache_creation_input_tokens: 0,
+              cache_read_input_tokens: 0,
+            },
+          },
+        } as unknown as BetaRawMessageStreamEvent,
+        ttftMs: 0,
+      }
+      yield {
+        type: 'stream_event',
+        event: {
+          type: 'content_block_start',
+          index: 0,
+          content_block: { type: 'text', text: '' },
+        } as unknown as BetaRawMessageStreamEvent,
+      }
+    }
+
+    // Yield the final AssistantMessage so the query loop can process it.
+    const assistantMessage = createAssistantMessage({
+      content: fullText,
+    })
+    yield assistantMessage
+
+    // Remaining synthetic events to properly close the stream in the UI.
+    yield {
+      type: 'stream_event',
+      event: {
+        type: 'content_block_stop',
+        index: 0,
+      } as unknown as BetaRawMessageStreamEvent,
+    }
+    yield {
+      type: 'stream_event',
+      event: {
+        type: 'message_delta',
+        delta: { stop_reason: 'end_turn', stop_sequence: null },
+        usage: { output_tokens: 0 },
+      } as unknown as BetaRawMessageStreamEvent,
+    }
+    yield {
+      type: 'stream_event',
+      event: {
+        type: 'message_stop',
+      } as unknown as BetaRawMessageStreamEvent,
+    }
+  } catch (err) {
+    const msg =
+      err instanceof Error ? err.message : `Unexpected error: ${String(err)}`
+    yield createAssistantAPIErrorMessage({
+      content: msg,
+      apiError: 'api_error',
+    })
+  }
+}
+
 async function* queryModel(
   messages: Message[],
   systemPrompt: SystemPrompt,
@@ -1045,6 +1213,14 @@ async function* queryModel(
       new Error(CUSTOM_OFF_SWITCH_MESSAGE),
       options.model,
     )
+    return
+  }
+
+  // OpenAI-compatible Responses API path (Stage 1: text-only streaming).
+  // Activated when CLAUDE_CODE_OPENAI_COMPAT=1. Tool/function calling is
+  // NOT supported in Stage 1 — the existing Anthropic path handles tools.
+  if (isEnvTruthy(process.env.CLAUDE_CODE_OPENAI_COMPAT)) {
+    yield* queryModelOpenAICompat(messages, systemPrompt, signal)
     return
   }
 
